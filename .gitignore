@@ -1,0 +1,15 @@
+__pycache__/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+fixtures/private/
+fixtures/assets/fixture.ttf
+reports/
+test pdf/
+settings.json
+.tools/
+.venv/
+.wheelhouse/
+.build/
+dist/
