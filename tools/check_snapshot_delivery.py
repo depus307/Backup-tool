@@ -15,10 +15,9 @@ from openpyxl import load_workbook
 from pypdf import PdfReader
 
 from backuptool.archive import Archive, result_label
-from backuptool.evidence import original_path
+from backuptool.evidence import format_capture_time, original_path
 from backuptool.controller import WorkerSession
-from tools.check_delivery import job
-from tools.fixture_server import ASSETS, serving
+from tools.fixture_server import ASSETS, run_worker, serving
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,7 +31,7 @@ def main():
     parser.add_argument('--exe', type=Path)
     parser.add_argument('--manual', action='store_true')
     args = parser.parse_args()
-    folder = ROOT / 'reports' / 'snapshot-2.2' / ('frozen' if args.exe else 'source')
+    folder = ROOT / 'reports' / 'snapshot-2.1' / ('frozen' if args.exe else 'source')
     folder.mkdir(parents=True, exist_ok=True)
     # Every acceptance run has its own archive; never edit a user's archive.
     folder = folder / time.strftime('%Y%m%d-%H%M%S')
@@ -46,7 +45,7 @@ def main():
         sequence += 1
         payload['_diagnostics'] = True
         if not args.exe:
-            return job(payload)
+            return run_worker(payload)
         request = folder / f'job-{sequence}.json'
         report = folder / f'job-{sequence}-result.json'
         request.write_text(json.dumps(payload), encoding='utf-8')
@@ -62,33 +61,43 @@ def main():
         routes = ['/simple', '/spa', '/expired', '/status/400', '/status/402', '/status/403',
                   '/status/404', '/status/429', '/status/500', '/status/502', '/status/503',
                   '/status/504', '/challenge', '/login', '/blank', '/redirect-error',
-                  '/expired.pdf', '/inline.pdf', '/original.docx', '/fake.pdf']
+                  '/expired.pdf', '/inline.pdf', '/original.docx', '/fake.pdf', '/blank-styled', '/image-only']
         # Closed loopback port exercises a connection failure without external DNS/network.
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             dead_url = f'http://127.0.0.1:{sock.getsockname()[1]}/unreachable'
         source = folder / 'source.csv'
         source.write_text('ИНН;Компания;URL\n' + '\n'.join(
-            f'0123456789;Snapshot;{base}{route}' for route in routes) + '\n'
+            f'0123456789;Snapshot Test;{base}{route}' for route in routes) + '\n'
             + f'0987654321;Offline;{dead_url}\n', encoding='utf-8-sig')
         archive_path = folder / 'archive'
         print('Running browser worker', flush=True)
         final, events = run({'archive': str(archive_path), 'source': str(source), 'browser': 'chrome'})
-        assert final['counts'] == {'ready': 19, 'document': 1, 'error': 1}, final
+        assert final['counts'] == {'ready': 4, 'saved_error': 15, 'document': 1, 'error': 3}, final
         with sqlite3.connect(archive_path / 'archive.sqlite3') as db:
             db.row_factory = sqlite3.Row
             rows = {row['url']: dict(row) for row in db.execute('SELECT * FROM resources')}
             history = [dict(row) for row in db.execute('SELECT * FROM attempts')]
-        for route in routes[:-3]:
+        snapshots = []
+        for route in routes:
             row = rows[base + route]
-            assert row['state'] == 'ready' and row['http_status'], row
+            if route in ('/blank', '/blank-styled', '/fake.pdf', '/original.docx'):
+                continue
+            assert row['state'] in ('ready', 'saved_error') and row['http_status'], row
             assert datetime.fromisoformat(row['checked_at']).utcoffset() is not None, row
-            text = pdf_text(archive_path / row['path'])
-            assert row['checked_at'] in text and f'HTTP {row["http_status"]}' in text, text
+            path = archive_path / row['path']
+            snapshots.append(path)
+            text = pdf_text(path)
+            assert format_capture_time(row['checked_at']) in text and f'HTTP {row["http_status"]}' in text, text
             assert row['final_url'] in text, text
             assert any(a['resource_id'] == row['id'] and a['checked_at'] == row['checked_at']
                        and a['http_status'] == row['http_status'] and a['reason'] == row['reason']
                        for a in history)
+        assert len({path.parent for path in snapshots}) == 1
+        stem = 'Snapshot-Test_0123456789'
+        assert {path.name for path in snapshots} == {
+            f'{stem}.pdf', *(f'{stem}_{i}.pdf' for i in range(1, len(snapshots)))
+        }
         for route in routes:
             if route.startswith('/status/'):
                 status = int(route.rsplit('/', 1)[1])
@@ -107,11 +116,18 @@ def main():
         assert rows[base + '/challenge']['reason'] and rows[base + '/login']['reason']
         assert 'CHALLENGE-PENDING' in pdf_text(archive_path / rows[base + '/challenge']['path'])
         assert 'SPA-READY' in pdf_text(archive_path / rows[base + '/spa']['path'])
-        assert rows[base + '/blank']['reason']
+        for route in ('/blank', '/blank-styled'):
+            row = rows[base + route]
+            assert row['state'] == 'error' and 'пустую страницу' in row['reason'], row
+            assert not row['path'] and not row['checked_at'] and row['http_status'] == 200, row
+        assert rows[base + '/image-only']['state'] == 'ready'
+        assert rows[base + '/simple']['path'] != rows[base + '/image-only']['path']
         access = rows[dead_url]
-        assert access['state'] == 'ready' and access['quality'].startswith('access_')
-        text = pdf_text(archive_path / access['path'])
-        assert dead_url in text and 'ERR_CONNECTION_REFUSED' in text and access['checked_at'] in text
+        assert access['state'] == 'saved_error' and access['quality'] == 'access_screenshot', access
+        access_path = archive_path / access['path']
+        text = pdf_text(access_path)
+        assert dead_url in text and 'ERR_CONNECTION_REFUSED' in text and format_capture_time(access['checked_at']) in text
+        assert 'BackupTool' not in text and any(page.images for page in PdfReader(access_path).pages)
         assert access['http_status'] is None
         assert rows[base + '/fake.pdf']['state'] == 'error' and not rows[base + '/fake.pdf']['path']
         catalog = rows[base + '/inline.pdf']
@@ -119,7 +135,7 @@ def main():
         assert catalog['quality'] == 'dated_document'
         assert original_path(catalog_path).read_bytes() == (ASSETS / 'useful.pdf').read_bytes()
         assert 'ORIGINAL-PDF-001' in pdf_text(catalog_path)
-        assert catalog['checked_at'] in pdf_text(catalog_path)
+        assert format_capture_time(catalog['checked_at']) in pdf_text(catalog_path)
         assert (archive_path / rows[base + '/original.docx']['path']).read_bytes() == (ASSETS / 'original.docx').read_bytes()
         checks.append('Real Chrome: error HTML 400/402/403/404/429/500/502/503/504, Tilda-like placeholder, '
                       'login/challenge/blank/SPA, redirects, HTML at document URL; no repeated HTML requests')
@@ -128,17 +144,17 @@ def main():
         report = Path(next(e['path'] for e in events if e['type'] == 'report'))
         book = load_workbook(report, read_only=True)
         try:
-            assert book['Все результаты'].max_row is None or book['Все результаты'].max_row == 22
             data = list(book['Все результаты'].values)
-            assert len(data) == 22 and len(list(book['Нужны действия'].values)) == 2
-            assert len(list(book['Снимки с предупреждениями'].values)) == 17
-            assert data[3][3] == 'Снимок сохранён · HTTP 402'
-            assert data[3][11] == '402' and data[3][12] == rows[base + '/expired']['checked_at']
+            assert len(data) == 24 and len(list(book['Нужны действия'].values)) == 19
+            assert len(list(book['Снимки с предупреждениями'].values)) == 16
+            assert data[3][3] == 'Сохранено как ошибка · HTTP 402'
+            assert data[3][11:13] == ('402', format_capture_time(rows[base + '/expired']['checked_at']))
+            assert list(book['Все результаты'].rows)[3][3].fill.fgColor.rgb == '00FFF0BF'
         finally:
             book.close()
         with report.with_suffix('.csv').open(encoding='utf-8-sig', newline='') as stream:
             data = list(csv.reader(stream, delimiter=';'))
-        assert data[3][11:13] == ['402', rows[base + '/expired']['checked_at']]
+        assert data[3][11:13] == ['402', format_capture_time(rows[base + '/expired']['checked_at'])]
         checks.append('XLSX/CSV preserve HTTP status, exact capture timestamp and warnings; failures have no fake snapshot')
 
         before = server.requests.copy()
@@ -185,7 +201,7 @@ def main():
                 for column in ('http_status', 'checked_at', 'original_sha'):
                     db.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
         with _archive(legacy) as archive:
-            assert len(archive.rows(old_list)) == 21
+            assert len(archive.rows(old_list)) == 23
             assert all(row['http_status'] is None and not row['checked_at'] for row in archive.rows(old_list))
             assert hashlib.sha256(old_path.read_bytes()).hexdigest() == old_hash
             assert archive.reusable(next(r for r in archive.resources(old_list) if r['id'] == resource['id']))
@@ -216,7 +232,7 @@ def main():
                 manual = next(r for r in archive.resources(final['list_id']) if r['id'] == first['id'])
                 assert manual['quality'] == 'manual' and manual['http_status'] == 402
                 text = pdf_text(archive_path / manual['path'])
-                assert 'TILDA-EXPIRED' in text and manual['checked_at'] in text
+                assert 'TILDA-EXPIRED' in text and format_capture_time(manual['checked_at']) in text
             assert server.requests['/expired'] == count + 1
             checks.append('Visible Chrome manual capture saves HTTP 402 without reloading and records exact metadata')
 

@@ -7,8 +7,7 @@ import time
 from pypdf import PdfReader
 
 from backuptool.controller import WorkerSession
-from tools.check_delivery import job
-from tools.fixture_server import ASSETS, serving
+from tools.fixture_server import ASSETS, run_worker, serving
 
 
 def main():
@@ -19,7 +18,7 @@ def main():
         source.write_text(f'ИНН;Компания;URL\n0123456789;Ручной PDF;{base}/spa\n'
                           f'0987654321;Вложение;{base}/status/404\n', encoding='utf-8-sig')
         archive = str(folder / 'archive')
-        loaded, _ = job({'operation': 'import', 'archive': archive, 'source': str(source)})
+        loaded, _ = run_worker({'operation': 'import', 'archive': archive, 'source': str(source)})
         list_id = loaded['list_id']
         db = sqlite3.connect(Path(archive) / 'archive.sqlite3')
         ids = [r[0] for r in db.execute('SELECT id FROM input_rows WHERE list_id=? ORDER BY id', (list_id,))]
@@ -48,8 +47,8 @@ def main():
         text = ''.join(p.extract_text() for p in PdfReader(Path(archive) / path).pages)
         assert 'SPA-READY' in text and base + '/spa' in text
         assert server.requests['/spa'] == 1, server.requests
-        job({'operation': 'attach', 'archive': archive, 'list_id': list_id, 'row_id': ids[1],
-             'pdf': str(ASSETS / 'useful.pdf')})
+        run_worker({'operation': 'attach', 'archive': archive, 'list_id': list_id, 'row_id': ids[1],
+                    'pdf': str(ASSETS / 'useful.pdf')})
         path, quality = db.execute('SELECT path,quality FROM resources WHERE id=(SELECT resource_id '
                                   'FROM input_rows WHERE id=?)', (ids[1],)).fetchone()
         assert quality == 'manual_attachment'

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
+from io import BytesIO
 import os
 import re
 from pathlib import Path
@@ -16,8 +17,8 @@ from urllib.parse import urlsplit
 import uuid
 import zipfile
 
-from .archive import Archive, export_reports, GOOD, LABELS
-from .evidence import dated_pdf, original_path
+from .archive import Archive, backup_name, export_reports, GOOD, LABELS, SAVED
+from .evidence import dated_pdf, has_page_content, original_path
 
 MAX_BYTES = 100 * 1024 * 1024
 DOCUMENTS = {'.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.rtf', '.odt', '.ods', '.odp'}
@@ -32,6 +33,16 @@ MIMES = {'application/pdf': '.pdf', 'application/msword': '.doc',
 
 
 class NeedsHelp(Exception):
+    pass
+
+
+class CaptureError(Exception):
+    def __init__(self, reason, url, status=None):
+        self.url, self.status = url, status
+        super().__init__(reason)
+
+
+class EmptyCapture(CaptureError):
     pass
 
 
@@ -61,8 +72,6 @@ def capture_reason(status, url, title, text, navigation_note=''):
     warning = blocked(url, title, text)
     if warning:
         notes.append(warning)
-    if not text.strip():
-        notes.append('Страница без текста; сохранено отображаемое состояние')
     if navigation_note:
         notes.append(navigation_note)
     return '; '.join(notes)
@@ -78,11 +87,18 @@ class HttpFailure(Exception):
         super().__init__(f'HTTP {code}')
 
 
-def blocked(url, title, text):
+def google_captcha(url, title, text):
     p = urlsplit(url)
-    host = (p.hostname or '').lower()
-    if ('google.' in host and p.path.startswith('/sorry')):
-        return 'Сохранена страница проверки Google /sorry'
+    google = re.fullmatch(r'(?:[a-z0-9-]+\.)*google\.(?:[a-z]{2,3}|(?:co|com)\.[a-z]{2})', p.hostname or '')
+    if not google:
+        return False
+    return p.path == '/sorry' or p.path.startswith('/sorry/') or any(
+        message in (title + '\n' + text[:1500]).casefold() for message in (
+            'our systems have detected unusual traffic', 'unusual traffic from your computer network',
+            'мы зарегистрировали подозрительный трафик', 'из вашей сети поступает подозрительный трафик'))
+
+
+def blocked(url, title, text):
     title, text = title.casefold(), text[:4000].casefold()
     signals = ('подтвердите, что вы человек', 'verify you are human', 'checking your browser',
                'just a moment', 'проверка браузера', 'unusual traffic', 'доступ запрещён',
@@ -268,18 +284,31 @@ async def settle(page):
 
 async def print_page(page, staged, checked_at, http_status, *, url=None):
     url = url or page.url
-    checked_at = checked_at or capture_time()
-    address = escape(url)
-    visible = escape(url if len(url) <= 500 else url[:497] + '…')
-    status = f' · HTTP {http_status}' if http_status else ''
-    footer = ('<div style="margin:0 8mm;width:100%;font:9px sans-serif;overflow-wrap:anywhere">'
-              f'Адрес: <a href="{address}">{visible}</a><br>'
-              f'Дата и время снимка: {escape(checked_at)}{status}</div>')
     await page.emulate_media(media='screen')
-    await page.pdf(path=str(staged), format='A4', print_background=True, display_header_footer=True,
-                   header_template='<span></span>', footer_template=footer,
-                   margin={'top': '10mm', 'bottom': '28mm', 'left': '8mm', 'right': '8mm'})
-    return url
+    pdf = await page.pdf(format='A4', print_background=True,
+                         margin={'top': '10mm', 'bottom': '28mm', 'left': '8mm', 'right': '8mm'})
+    if not has_page_content(BytesIO(pdf)):
+        raise EmptyCapture('Ошибка снимка: браузер сформировал пустую страницу', url, http_status)
+    dated_pdf(BytesIO(pdf), staged, url, checked_at, http_status, reserved_footer=True)
+
+
+async def capture_html(page, staged, status, navigation_note=''):
+    for index in range(2):
+        url = page.url
+        title = await page.title()
+        text = await page.evaluate("() => document.body?.innerText || ''")
+        if google_captcha(url, title, text):
+            raise CaptureError('Капча Google не пройдена. Откройте сайт и пройдите проверку вручную.', url, status)
+        checked_at = capture_time()
+        try:
+            await print_page(page, staged, checked_at, status)
+        except EmptyCapture:
+            if index:
+                raise
+            await page.wait_for_timeout(1200)
+        else:
+            return CaptureResult('.pdf', url, status, checked_at,
+                                 capture_reason(status, url, title, text, navigation_note))
 
 
 def access_code(detail):
@@ -291,17 +320,25 @@ async def save_access_error(page, staged, url, detail, status=None, *, wait_for_
     checked_at = capture_time()
     code = access_code(detail)
     screenshot = None
-    try:
-        if wait_for_error and page.url != 'chrome-error://chromewebdata/':
-            await page.wait_for_url('chrome-error://chromewebdata/', wait_until='commit', timeout=900)
-        if page.url == 'chrome-error://chromewebdata/':
-            await page.locator('body').wait_for(state='visible', timeout=1000)
-            screenshot = await page.screenshot(timeout=2000)
-    except Exception:
-        pass
+    if wait_for_error:
+        # The failed navigation can return before Chrome commits its error page.
+        # Retry across execution context changes and avoid background-tab RAF throttling.
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and not page.is_closed():
+            try:
+                await page.wait_for_function("""() => {
+                    const screen = document.querySelector('#main-frame-error, #interstitial-wrapper, #main-content');
+                    return (location.protocol === 'chrome-error:' || screen?.id === 'main-frame-error') &&
+                        !!(screen || document.body?.innerText.trim());
+                }""", polling=100, timeout=1000)
+                await page.bring_to_front()
+                screenshot = await page.screenshot(timeout=2500)
+                break
+            except Exception:
+                await asyncio.sleep(.1)
     evidence = await page.context.new_page()
     try:
-        heading = 'Экран ошибки браузера' if screenshot else 'Отчёт BackupTool о попытке доступа'
+        heading = 'Экран ошибки браузера' if screenshot else 'Ошибка доступа к сайту'
         picture = (f'<img alt="Экран ошибки Chrome" src="data:image/png;base64,{b64encode(screenshot).decode()}">'
                    if screenshot else '')
         await evidence.set_content(
@@ -364,10 +401,11 @@ async def capture(pool, url, staged, pdf_lock):
             try:
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
             except Exception as error:
+                if main.get('status') in (204, 205):
+                    raise EmptyCapture('Ошибка снимка: сервер вернул пустую страницу', main['url'], main['status']) from error
                 if main and main['status'] < 400 and document_response(main['headers']):
                     return await browser_document(page, main['url'], staged, pdf_response(main['headers'], main['url']))
-                if (not main or not page.url.startswith(('http://', 'https://'))
-                        or main.get('status') in (204, 205)):
+                if not main or not page.url.startswith(('http://', 'https://')):
                     async with pdf_lock:
                         target = failed.get('url') or main.get('url') or url
                         detail = str(error)
@@ -384,14 +422,8 @@ async def capture(pool, url, staged, pdf_lock):
                 async with pdf_lock:
                     return await save_access_error(page, staged, url, 'Сервер не вернул страницу для сохранения')
             await settle(page)
-            title = await page.title()
-            text = await page.locator('body').inner_text(timeout=5000)
-            status = main.get('status')
-            reason = capture_reason(status, page.url, title, text, navigation_note)
             async with pdf_lock:
-                checked_at = capture_time()
-                final_url = await print_page(page, staged, checked_at, status)
-            return CaptureResult('.pdf', final_url, status, checked_at, reason)
+                return await capture_html(page, staged, main.get('status'), navigation_note)
         finally:
             await page.close()
 
@@ -437,7 +469,7 @@ class Runner:
         for resource in archive.resources(list_id):
             if resource['url'].startswith('invalid:'):
                 continue
-            if archive.reusable(resource) and (not refresh or only_actions):
+            if archive.reusable(resource) and (not refresh or only_actions and resource['state'] in GOOD):
                 continue
             queue.append(resource)
         total = len(queue)
@@ -484,10 +516,11 @@ class Runner:
                                             if retry or not transient:
                                                 raise
                                             await asyncio.sleep(max(1, getattr(error, 'retry_after', 0)))
-                                    owner = archive.db.execute('SELECT inn,company FROM input_rows WHERE resource_id=? '
-                                                               'ORDER BY id LIMIT 1', (resource['id'],)).fetchone()
-                                    name = '_'.join(v for v in owner if v) if owner else host
-                                    archive.publish(attempt, staged, name or host, result.extension,
+                                    owner = archive.db.execute('SELECT company,inn FROM input_rows WHERE resource_id=? '
+                                                               'ORDER BY list_id<>?, id LIMIT 1',
+                                                               (resource['id'], list_id)).fetchone()
+                                    name = backup_name(owner['company'], owner['inn'], resource['url'])
+                                    archive.publish(attempt, staged, name, result.extension,
                                                     result.quality or ('automatic' if result.extension == '.pdf' else 'original'),
                                                     result.final_url, result.reason, result.http_status, result.checked_at,
                                                     result.original)
@@ -498,6 +531,9 @@ class Runner:
                             except NeedsHelp as error:
                                 archive.fail(attempt, 'needs_help', str(error))
                                 self.log('needs_help', resource['url'], str(error))
+                            except CaptureError as error:
+                                archive.fail(attempt, 'error', str(error), error.url, error.status)
+                                self.log('error', resource['url'], str(error))
                             except Exception as error:
                                 if self.payload.get('_diagnostics'):
                                     self.send('diagnostic', traceback=traceback.format_exc())
@@ -505,7 +541,8 @@ class Runner:
                                 archive.fail(attempt, 'error', reason)
                                 self.log('error', resource['url'], reason)
                             else:
-                                self.log('ready' if result.extension == '.pdf' else 'document',
+                                self.log('saved_error' if result.reason else
+                                         'ready' if result.extension == '.pdf' else 'document',
                                          resource['url'], result.reason)
                             finally:
                                 # Only this attempt's registered staging file is removed.
@@ -553,7 +590,7 @@ class Runner:
         outcome = 'cancelled'
         async with async_playwright() as playwright:
             browser = await launch(playwright, self.payload.get('browser', 'chrome'), headed=True)
-            context = await browser.new_context(accept_downloads=True, viewport=None)
+            context = await browser.new_context(accept_downloads=True, viewport=None, locale='ru-RU')
             responses = {}
             failures = {}
 
@@ -603,17 +640,22 @@ class Runner:
                                 async with asyncio.timeout(45):
                                     result = await self.save_tab(selected, staged, responses.get(selected),
                                                                  failures.get(selected))
-                                    archive.publish(attempt, staged, row['company'] or row['inn'],
+                                    archive.publish(attempt, staged, backup_name(row['company'], row['inn'], resource['url']),
                                                     extension=result.extension, quality=result.quality or 'manual',
                                                     final_url=result.final_url, reason=result.reason,
                                                     http_status=result.http_status, checked_at=result.checked_at,
                                                     original=result.original)
+                            except CaptureError as error:
+                                archive.fail(attempt, 'error', str(error), error.url, error.status)
+                                self.log('error', error.url, str(error))
+                                self.send('notice', text=str(error))
                             except Exception as error:
                                 archive.fail(attempt, 'needs_help', f'Ручное сохранение: {error}')
                                 self.send('notice', text=f'Не сохранено: {error}. Можно повторить или прикрепить PDF.')
                             else:
                                 outcome = 'success'
-                                self.log('ready' if result.extension == '.pdf' else 'document',
+                                self.log('saved_error' if result.reason else
+                                         'ready' if result.extension == '.pdf' else 'document',
                                          result.final_url, result.reason)
                                 break
                             finally:
@@ -631,6 +673,8 @@ class Runner:
         observed_url, status, headers = response or ('', None, {})
         if failure and (url.startswith('chrome-error:') or url == 'about:blank'):
             target, detail = failure
+            if status in (204, 205) and observed_url == target:
+                raise EmptyCapture('Ошибка снимка: сервер вернул пустую страницу', target, status)
             if 'ERR_ABORTED' in detail and observed_url == target and document_response(headers):
                 return await browser_document(selected, target, staged, pdf_response(headers, target))
             return await save_access_error(selected, staged, target, detail,
@@ -644,11 +688,7 @@ class Runner:
                 return await browser_document(selected, url, staged, pdf_response(headers, url))
             if await pdf_viewer(selected):
                 return await browser_document(selected, url, staged, pdf=True)
-        text = await selected.locator('body').inner_text(timeout=5000)
-        reason = capture_reason(status, url, await selected.title(), text)
-        checked_at = capture_time()
-        final_url = await print_page(selected, staged, checked_at, status)
-        return CaptureResult('.pdf', final_url, status, checked_at, reason)
+        return await capture_html(selected, staged, status)
 
     async def execute(self):
         archive = Archive(self.payload['archive'])
@@ -675,7 +715,8 @@ class Runner:
                 staged = archive.work_dir(run) / (attempt + '.part')
                 try:
                     shutil.copyfile(self.payload['pdf'], staged)
-                    archive.publish(attempt, staged, row['company'] or row['inn'], quality='manual_attachment',
+                    archive.publish(attempt, staged, backup_name(row['company'], row['inn'], row['url']),
+                                    quality='manual_attachment',
                                     final_url=row['url'])
                 except Exception as error:
                     archive.fail(attempt, 'needs_help', f'Прикрепление: {error}')
@@ -687,7 +728,7 @@ class Runner:
             elif operation == 'verify':
                 resources = archive.resources(list_id)
                 for item in resources:
-                    if item['state'] in GOOD and not archive.reusable(item, full=True):
+                    if item['state'] in SAVED and not archive.reusable(item, full=True):
                         with archive.db:
                             archive.db.execute("UPDATE resources SET state='error',reason=? WHERE id=?",
                                                ('Файл отсутствует, повреждён или изменён; нужен повтор', item['id']))

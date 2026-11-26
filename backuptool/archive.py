@@ -14,27 +14,32 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-from .evidence import original_path
+from .evidence import format_capture_time, original_path
 
 LABELS = {'pending': 'В очереди', 'running': 'Обработка', 'ready': 'Готово',
           'document': 'Оригинал документа', 'needs_help': 'Нужна помощь',
-          'error': 'Ошибка', 'interrupted': 'Прервано'}
+          'error': 'Ошибка', 'saved_error': 'Сохранено как ошибка', 'interrupted': 'Прервано'}
 GOOD = ('ready', 'document')
+SAVED = (*GOOD, 'saved_error')
 
 
 def result_label(row):
     label = LABELS.get(row['state'], row['state'])
     status = row.get('http_status')
     quality = row.get('quality', '')
-    if row['state'] in GOOD and quality.startswith('access_'):
-        return 'Ошибка доступа зафиксирована'
+    if row['state'] == 'saved_error' or (row['state'] in GOOD and (quality.startswith('access_')
+                                                                 or row.get('reason') or (status or 0) >= 400)):
+        return LABELS['saved_error'] + (f' · HTTP {status}' if (status or 0) >= 400 else '')
     if row['state'] in GOOD and quality == 'dated_document':
         return 'Документ сохранён'
-    if row['state'] in GOOD and status and status >= 400:
-        return f'Снимок сохранён · HTTP {status}'
-    if row['state'] in GOOD and row.get('reason'):
-        return 'Снимок с предупреждением'
     return label
+
+
+def backup_name(company, inn, url):
+    company = company.strip() or (urlsplit(url).hostname or 'site')
+    company = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', '-', company).strip(' .-') or 'site'
+    inn = re.sub(r'[^\w-]+', '-', inn).strip('-')
+    return company[:90].rstrip(' .-') + (f'_{inn[:30]}' if inn else '')
 
 
 def hide_service_file(path):
@@ -200,6 +205,14 @@ class Archive:
                     if name not in columns:
                         self.db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
         self.recover()
+        with self.db:
+            for table in ('resources', 'attempts'):
+                self.db.execute(f"""UPDATE {table} SET state='saved_error'
+                    WHERE state IN ('ready','document') AND
+                    (reason <> '' OR quality LIKE 'access_%' OR http_status >= 400)""")
+            self.db.execute("""UPDATE resources SET state='error',path='',size=0,checked_at='',
+                reason='Капча Google не пройдена. Откройте сайт и пройдите проверку вручную.'
+                WHERE state='saved_error' AND reason LIKE '%проверки Google /sorry%'""")
 
     def close(self):
         try:
@@ -281,13 +294,13 @@ class Archive:
                             (time.time(), resource))
         return attempt
 
-    def fail(self, attempt, state, reason, final_url=''):
+    def fail(self, attempt, state, reason, final_url='', http_status=None):
         with self.db:
-            self.db.execute('UPDATE attempts SET ended=?,state=?,reason=?,final_url=? WHERE id=?',
-                            (time.time(), state, reason, final_url, attempt))
-            self.db.execute('''UPDATE resources SET state=?,reason=?,final_url=?,updated=?
+            self.db.execute('UPDATE attempts SET ended=?,state=?,reason=?,final_url=?,http_status=? WHERE id=?',
+                            (time.time(), state, reason, final_url, http_status, attempt))
+            self.db.execute('''UPDATE resources SET state=?,reason=?,final_url=?,http_status=?,updated=?
                                WHERE id=(SELECT resource_id FROM attempts WHERE id=?)''',
-                            (state, reason, final_url, time.time(), attempt))
+                            (state, reason, final_url, http_status, time.time(), attempt))
 
     def publish(self, attempt, staged, name, extension='.pdf', quality='automatic', final_url='',
                 reason='', http_status=None, checked_at='', original=None):
@@ -297,8 +310,15 @@ class Archive:
         sha = hashlib.sha256(staged.read_bytes()).hexdigest()
         original_sha = hashlib.sha256(original.read_bytes()).hexdigest() if original else ''
         item = self.db.execute('SELECT * FROM attempts WHERE id=?', (attempt,)).fetchone()
-        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:60] or 'site'
-        target = self.root / 'captures' / item['run_id'] / f'{safe}__{attempt[:12]}{extension}'
+        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '-', name).strip(' .')[:120].rstrip(' .') or 'site'
+        if re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])', safe.split('.')[0], re.I):
+            safe = '_' + safe
+        folder = self.root / 'captures' / item['run_id']
+        target = folder / (safe + extension)
+        copy_number = 0
+        while target.exists() or original_path(target).exists():
+            copy_number += 1
+            target = folder / f'{safe}_{copy_number}{extension}'
         target.parent.mkdir(parents=True, exist_ok=True)
         with self.db:
             self.db.execute('''UPDATE attempts SET state='publishing',staged=?,target=?,sha=?,quality=?,final_url=?,
@@ -323,7 +343,9 @@ class Archive:
 
     def _finish_publication(self, item, target):
         stat = target.stat()
-        state = 'ready' if target.suffix == '.pdf' else 'document'
+        state = ('saved_error' if item['reason'] or item['quality'].startswith('access_')
+                 or (item['http_status'] or 0) >= 400 else
+                 'ready' if target.suffix == '.pdf' else 'document')
         with self.db:
             self.db.execute('UPDATE attempts SET state=?,ended=? WHERE id=?', (state, time.time(), item['id']))
             self.db.execute('''UPDATE resources SET state=?,reason=?,path=?,sha=?,size=?,mtime=?,quality=?,
@@ -333,7 +355,7 @@ class Archive:
                  item['checked_at'], item['original_sha'], time.time(), item['resource_id']))
 
     def reusable(self, resource, full=False):
-        if resource['state'] not in GOOD or not resource['path']:
+        if resource['state'] not in SAVED or not resource['path']:
             return False
         path = self.root / resource['path']
         try:
@@ -362,7 +384,7 @@ class Archive:
 
 REPORT_FIELDS = ('inn', 'company', 'url', 'state', 'reason', 'final_url', 'path', 'quality', 'sheet', 'number')
 REPORT_HEADERS = ('ИНН', 'Компания', 'URL', 'Результат', 'Причина', 'Конечный URL', 'Файл', 'Проверка', 'Лист', 'Строка')
-EXPORT_HEADERS = REPORT_HEADERS + ('Время обработки', 'HTTP-статус', 'Дата и время снимка (с часовым поясом)',
+EXPORT_HEADERS = REPORT_HEADERS + ('Время обработки', 'HTTP-статус', 'Дата и время снимка',
                                    'Исходный PDF', 'SHA-256 исходного PDF')
 
 
@@ -377,12 +399,13 @@ def report_values(row, root):
 def export_reports(archive, list_id):
     from openpyxl import Workbook
     from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import PatternFill
     rows = archive.rows(list_id)
     def export_values(row):
         stamp = (datetime.fromtimestamp(row['updated']).astimezone().isoformat(timespec='seconds')
                  if row['updated'] and row['state'] != 'pending' else '')
         original = str(original_path(archive.root / row['path'])) if row['original_sha'] and row['path'] else ''
-        return report_values(row, archive.root) + [stamp, str(row['http_status'] or ''), row['checked_at'],
+        return report_values(row, archive.root) + [stamp, str(row['http_status'] or ''), format_capture_time(row['checked_at']),
                                                     original, row['original_sha']]
 
     folder = archive.root / 'exports' / list_id[:12]
@@ -391,9 +414,11 @@ def export_reports(archive, list_id):
     target = folder / f'report-{stamp}.xlsx'
     temp = target.with_suffix('.part.xlsx')
     book = Workbook(write_only=True)
+    fills = {'saved_error': PatternFill('solid', fgColor='FFF0BF'),
+             **{state: PatternFill('solid', fgColor='EEF9F2') for state in GOOD}}
     for title, subset in [('Все результаты', rows),
                           ('Нужны действия', [r for r in rows if r['state'] not in GOOD]),
-                          ('Снимки с предупреждениями', [r for r in rows if r['state'] in GOOD and r['reason']])]:
+                          ('Снимки с предупреждениями', [r for r in rows if r['state'] == 'saved_error'])]:
         sheet = book.create_sheet(title)
         sheet.freeze_panes = 'A2'
         for key, width in zip('ABCDEFGHIJKLMNO', [18, 35, 60, 36, 70, 60, 60, 20, 20, 12, 30, 16, 36, 65, 65]):
@@ -401,10 +426,12 @@ def export_reports(archive, list_id):
         sheet.append(EXPORT_HEADERS)
         for row in subset:
             cells = []
-            for value in export_values(row):
+            for index, value in enumerate(export_values(row)):
                 cell = WriteOnlyCell(sheet, value=value[:32767])
                 cell.data_type = 's'
                 cell.number_format = '@'
+                if index == 3 and row['state'] in fills:
+                    cell.fill = fills[row['state']]
                 cells.append(cell)
             sheet.append(cells)
     book.save(temp)

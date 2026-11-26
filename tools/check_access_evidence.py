@@ -12,7 +12,7 @@ import time
 
 from pypdf import PdfReader
 
-from backuptool.evidence import original_path
+from backuptool.evidence import format_capture_time, original_path
 from tools.fixture_server import serving
 
 CATALOG = 'https://kremlina.ru/assets/files/catalog.pdf'
@@ -45,7 +45,7 @@ def main():
     parser.add_argument('--batch-only', action='store_true')
     args = parser.parse_args()
     exe = args.exe.resolve()
-    folder = ROOT / 'reports/snapshot-2.2/access' / time.strftime('%Y%m%d-%H%M%S')
+    folder = ROOT / 'reports/snapshot-2.1/access' / time.strftime('%Y%m%d-%H%M%S')
     folder.mkdir(parents=True)
     archive = folder / 'archive'
 
@@ -66,12 +66,12 @@ def main():
 
     def evidence(row, expected):
         path = archive / row['path']
-        assert row['state'] == 'ready' and row['quality'].startswith('access_'), row
+        assert row['state'] == 'saved_error' and row['quality'].startswith('access_'), row
         pdf = PdfReader(path)
         text = '\n'.join(page.extract_text() for page in pdf.pages)
-        assert row['url'] in text and row['checked_at'] in text and expected in text, text
+        assert row['url'] in text and format_capture_time(row['checked_at']) in text and expected in text, text
         assert ('Экран ошибки браузера' if row['quality'] == 'access_screenshot'
-                else 'Отчёт BackupTool') in text, text
+                else 'Ошибка доступа к сайту') in text and 'BackupTool' not in text, text
         return path
 
     def catalog(row):
@@ -82,7 +82,7 @@ def main():
         original_pages, copy_pages = PdfReader(original).pages, PdfReader(path).pages
         assert len(original_pages) == len(copy_pages) == 38
         for page in copy_pages:
-            assert row['checked_at'] in page.extract_text()
+            assert format_capture_time(row['checked_at']) in page.extract_text()
             links = [ref.get_object() for ref in page.get('/Annots', [])]
             assert sum(link.get('/A', {}).get('/URI') == row['final_url'] for link in links) == 1
         return path
@@ -111,12 +111,12 @@ def main():
         text = PdfReader(archive / redirect['path']).pages[0].extract_text()
         assert base + '/expired' in text and base + '/redirect-error' not in text and 'HTTP 402' in text
         tilda_row = results[tilda]
-        assert tilda_row['state'] == 'ready' and tilda_row['http_status'] == 402, tilda_row
+        assert tilda_row['state'] == 'saved_error' and tilda_row['http_status'] == 402, tilda_row
         assert 'Please renew your subscription' in PdfReader(archive / tilda_row['path']).pages[0].extract_text()
         reported = {}
         for url in reported_sites:
             row = results[url]
-            assert row['state'] == 'ready' and row['path'], row
+            assert row['state'] in ('ready', 'saved_error') and row['path'], row
             reported[url] = {'quality': row['quality'], 'reason': row['reason'], 'http_status': row['http_status']}
         manual_urls = () if args.batch_only else (CATALOG, *cases)
         for index, url in enumerate(manual_urls):

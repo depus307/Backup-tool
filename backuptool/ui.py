@@ -12,8 +12,8 @@ from tkinter.scrolledtext import ScrolledText
 from urllib.parse import urlsplit
 
 from . import __version__
-from .archive import GOOD, REPORT_HEADERS, report_values, result_label
-from .evidence import original_path
+from .archive import GOOD, REPORT_HEADERS, SAVED, report_values, result_label
+from .evidence import format_capture_time, original_path
 from .clipboard import WindowsClipboard, clipboard_payload
 from .controller import WorkerSession
 from .ui_widgets import ProgressTrack, button_layout
@@ -21,11 +21,13 @@ from .ui_widgets import ProgressTrack, button_layout
 BG, PANEL, INK, MUTED = '#f5f7fb', '#ffffff', '#1e293b', '#52637b'
 LINE, SOFT, BLUE = '#d5deec', '#e8eef7', '#2957d1'
 STATE_COLORS = {'ready': '#14623d', 'document': '#14623d', 'error': '#a42a3e',
-                'needs_help': '#805008', 'running': BLUE, 'pending': MUTED, 'interrupted': MUTED}
+                'saved_error': '#805008', 'needs_help': '#805008', 'running': BLUE, 'pending': MUTED,
+                'interrupted': MUTED}
 RESULT_BACKGROUNDS = {'ready': '#eef9f2', 'document': '#eef9f2', 'error': '#fdf0f2',
-                      'needs_help': '#fff7e7'}
+                      'saved_error': '#fff0bf', 'needs_help': '#fff7e7'}
 FILTERS = (('all', 'Все'), ('actions', 'Нужны действия'), ('ready', 'Готово'),
-           ('error', 'Ошибки'), ('needs_help', 'Нужна помощь'), ('pending', 'В очереди'),
+           ('error', 'Ошибки'), ('saved_error', 'Сохранено как ошибка'),
+           ('needs_help', 'Нужна помощь'), ('pending', 'В очереди'),
            ('running', 'В работе'), ('interrupted', 'Прервано'))
 
 
@@ -715,10 +717,6 @@ class Application:
                 pass
             state = row['state']
             label = result_label(row).replace(' · ', '\n')
-            if label == 'Снимок с предупреждением':
-                label = 'Снимок сохранён\nС предупреждением'
-            elif label == 'Ошибка доступа зафиксирована':
-                label = 'Ошибка доступа\nЗафиксирована'
             values = (company + inn, address, '●  ' + label, file_size(row['size']))
             tags = (state, 'alternate') if i % 2 and state not in RESULT_BACKGROUNDS else (state,)
             if self.tree.exists(iid):
@@ -742,16 +740,17 @@ class Application:
         if not self.busy():
             unfinished = waiting + running + counts.get('interrupted', 0)
             done = all_count - unfinished
+            saved = ready + counts.get('saved_error', 0)
             self.update_progress(done, all_count)
             if self.refresh.get():
                 action = '↻  Обновить снимки'
             elif done and unfinished:
                 action = '▶  Продолжить'
-            elif done and ready < all_count:
+            elif done and saved < all_count:
                 action = '↻  Повторить ошибки'
             else:
                 action = '▶  Начать обработку'
-            ready_to_run = all_count and (unfinished or self.refresh.get() or ready < all_count)
+            ready_to_run = all_count and (unfinished or self.refresh.get() or saved < all_count)
             self.start_button.configure(text=action, style='Ready.TButton' if ready_to_run else 'Primary.TButton',
                                         state='normal' if all_count or self.source.get().strip() else 'disabled')
             if unfinished:
@@ -831,16 +830,17 @@ class Application:
                      (f'●  {result_label(row)}\n', state),
                      ('Исходная ссылка\n', 'muted'), (f'{row["url"]}\n', 'url')]
             if row.get('checked_at'):
-                parts.extend([('Дата и время снимка\n', 'muted'), (f'{row["checked_at"]}\n', '')])
+                stamp = format_capture_time(row['checked_at'])
+                parts.extend([('Дата и время снимка\n', 'muted'), (f'{stamp}\n', '')])
             if row.get('http_status'):
                 parts.extend([('HTTP-статус\n', 'muted'), (f'{row["http_status"]}\n', '')])
             if row['final_url'] and row['final_url'] != row['url']:
-                parts.extend([('Сохранённая страница\n', 'muted'), (f'{row["final_url"]}\n', 'url')])
+                parts.extend([('Конечный адрес\n', 'muted'), (f'{row["final_url"]}\n', 'url')])
             if row['reason']:
-                caption = 'Состояние сайта' if state in GOOD else 'Причина'
+                caption = 'Состояние сайта' if state in SAVED else 'Причина'
                 parts.extend([(f'\n{caption}\n', 'muted'), (f'{row["reason"]}\n', 'reason')])
             if row['path']:
-                label = 'Сохранённый файл' if state in GOOD else 'Файл предыдущей попытки'
+                label = 'Сохранённый файл' if state in SAVED else 'Файл предыдущей попытки'
                 parts.extend([(f'\n{label} · {file_size(row["size"])}\n', 'muted'),
                               (str(Path(row['path']).name), '')])
                 if row['quality'] == 'dated_document':
@@ -890,14 +890,15 @@ class Application:
         history = ScrolledText(panel, wrap='word', background=PANEL, foreground=INK, relief='flat', padx=8, pady=8)
         history.pack(fill='both', expand=True, pady=8)
         for index, attempt in enumerate(attempts):
-            stamp = time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(attempt['ended'] or attempt['started']))
+            stamp = time.strftime('%d.%m.%Y %H:%M', time.localtime(attempt['ended'] or attempt['started']))
             history.insert('end', f'{stamp}   {result_label(dict(attempt))}\n')
             if 'checked_at' in attempt.keys() and attempt['checked_at']:
-                history.insert('end', f'Дата и время снимка: {attempt["checked_at"]}\n')
+                stamp = format_capture_time(attempt['checked_at'])
+                history.insert('end', f'Дата и время снимка: {stamp}\n')
             for key in ('reason', 'final_url'):
                 if attempt[key]:
                     history.insert('end', attempt[key] + '\n')
-            if attempt['state'] in GOOD and attempt['target']:
+            if attempt['state'] in SAVED and attempt['target']:
                 target = Path(self.archive.get()) / attempt['target']
                 files = [('Открыть файл попытки', target)]
                 if 'original_sha' in attempt.keys() and attempt['original_sha']:

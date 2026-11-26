@@ -10,6 +10,25 @@ from urllib.parse import parse_qs, urlsplit
 ASSETS = Path(__file__).resolve().parents[1] / 'fixtures' / 'assets'
 
 
+def run_worker(payload):
+    from backuptool.controller import WorkerSession
+
+    session = WorkerSession()
+    session.start(payload=payload)
+    events = []
+    deadline = time.monotonic() + 150
+    try:
+        while session.state != 'finished':
+            events.extend(session.poll())
+            if time.monotonic() > deadline:
+                raise TimeoutError('Worker did not finish')
+            time.sleep(.05)
+        assert session.final['outcome'] == 'success', session.final
+        return session.final, events
+    finally:
+        session.close()
+
+
 def html(body, script=''):
     return ('''<!doctype html><html lang="ru"><meta charset="utf-8"><title>BackupTool fixture</title>
 <style>@font-face{font-family:Fixture;src:url('/assets/fixture.ttf')}body{font:18px Fixture,Arial;margin:40px;color:#17342f}table{border-collapse:collapse}td,th{border:1px solid #467;padding:12px}img{max-width:100%}</style>
@@ -74,6 +93,10 @@ class Handler(BaseHTTPRequestHandler):
             body = html('<h1>Войдите, чтобы продолжить</h1>')
         elif path == '/blank':
             body = html('')
+        elif path == '/blank-styled':
+            body = html('<style>html{background:white} h1{visibility:hidden}</style><h1>HIDDEN</h1>')
+        elif path == '/image-only':
+            body = html('<img src="/assets/image.svg" alt="">')
         elif path == '/delay':
             delay = min(2.0, max(0.0, float(query.get('seconds', ['0.2'])[0])))
             self.server.sleep(delay)
