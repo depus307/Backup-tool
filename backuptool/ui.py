@@ -167,6 +167,7 @@ class Application:
         self.available_update = None
         self.update_task = None
         self.update_label = tk.StringVar(value='Проверить обновления')
+        self.update_status = tk.StringVar()
         self.build()
         self.source.trace_add('write', self.source_changed)
         self.destination.trace_add('write', self.destination_changed)
@@ -180,7 +181,7 @@ class Application:
             result = updates.previous_result(distribution)
             if result:
                 if result['success']:
-                    self.set_status(f'BackupTool обновлён до {result["version"]}.')
+                    self.update_status.set(f'BackupTool обновлён до {result["version"]}.')
                 else:
                     self.set_status('Ошибка обновления: ' + result['error'])
         if not self.onboarding_seen:
@@ -411,6 +412,9 @@ class Application:
         about_button = ttk.Button(footer, text='О приложении', command=self.show_about)
         self.update_button = ttk.Button(footer, textvariable=self.update_label, command=self.check_or_update)
         self.update_button.pack(side='right')
+        self.update_status_label = ttk.Label(footer, textvariable=self.update_status, style='Muted.TLabel',
+                                            justify='right')
+        self.update_status_label.pack(side='right', padx=(0, 8))
         about_button.pack(side='right', padx=(0, 7))
 
         for widget, tip in (
@@ -597,6 +601,7 @@ class Application:
             return
         width = self.root.winfo_width()
         self.status_label.configure(wraplength=max(450, width - 40))
+        self.update_status_label.configure(wraplength=max(160, width - 635))
         narrow = width < 1010
         self.tree.configure(style='Compact.Treeview' if narrow else 'Treeview')
         if narrow:
@@ -1353,6 +1358,7 @@ class Application:
 
     def begin_update(self, task, action, *args):
         self.update_task = task
+        self.update_status.set('')
         self.update_button.configure(state='disabled')
         self.update_label.set('Проверка обновлений…' if task == 'check' else 'Загрузка обновления…')
 
@@ -1376,7 +1382,7 @@ class Application:
         if success and task == 'check':
             self.available_update = result
             if result is None:
-                self.set_status(f'Доступных обновлений для BackupTool {__version__} нет.')
+                self.update_status.set(f'Доступных обновлений для BackupTool {__version__} нет.')
         self.update_label.set(f'Обновить до {self.available_update.version}' if self.available_update
                               else 'Проверить обновления')
         if not success:
