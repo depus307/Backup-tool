@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .archive import GOOD, REPORT_HEADERS, SAVED, report_values, result_label
+from .delivery import default_destination, is_network_path
 from .evidence import format_capture_time, original_path
 from .clipboard import WindowsClipboard, clipboard_payload
 from .controller import WorkerSession
@@ -100,15 +101,24 @@ class Application:
     def __init__(self, root):
         self.root = root
         resources = Path(__file__).resolve().parents[1]
-        self.home = Path(sys.executable).parent if getattr(sys, 'frozen', False) else resources
+        distribution = Path(sys.executable).parent if getattr(sys, 'frozen', False) else resources
+        self.home = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'BackupTool'
         icon = resources / 'BackupToolNext.ico'
         if icon.is_file():
             root.iconbitmap(default=str(icon))
         self.settings_path = self.home / 'settings.json'
         try:
-            settings = json.loads(self.settings_path.read_text(encoding='utf-8'))
+            settings_file = self.settings_path if self.settings_path.is_file() else distribution / 'settings.json'
+            settings = json.loads(settings_file.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             settings = {}
+        previous_archive = settings.get('archive', str(distribution / 'archive'))
+        self.archive_root = Path(settings.get('archive_root', str(self.home / 'archive')))
+        destination = settings.get('destination', default_destination(
+            distribution / 'delivery.local.json', resources / 'delivery.json'))
+        if 'archive_root' not in settings and previous_archive and not is_network_path(previous_archive):
+            if (Path(previous_archive) / 'archive.sqlite3').is_file():
+                self.archive_root = Path(previous_archive).resolve()
         self.onboarding_seen = settings.get('onboarding_seen', False)
         root.title('BackupTool')
         root.geometry('1160x770')
@@ -116,7 +126,9 @@ class Application:
         root.tk.call('tk', 'scaling', 96 / 72)
         self.session = WorkerSession()
         self.source = tk.StringVar(value=settings.get('source', ''))
-        self.archive = tk.StringVar(value=settings.get('archive', str(self.home / 'archive')))
+        self.destination = tk.StringVar(value=destination)
+        self.destination_warning = tk.StringVar()
+        self.pending_delivery_label = tk.StringVar()
         self.gentle = tk.BooleanVar(value=settings.get('gentle', False))
         self.refresh = tk.BooleanVar()
         self.filter_key = 'all'
@@ -150,6 +162,8 @@ class Application:
         self.about_window = None
         self.build()
         self.source.trace_add('write', self.source_changed)
+        self.destination.trace_add('write', self.destination_changed)
+        self.destination_changed()
         self.refresh.trace_add('write', self.mark_dirty)
         self.clipboard = WindowsClipboard(root.winfo_id())
         self.load_lists()
@@ -165,6 +179,7 @@ class Application:
         style.configure('.', background=BG, foreground=INK, font=('Segoe UI', 10))
         style.configure('TLabel', background=BG)
         style.configure('Muted.TLabel', foreground=MUTED)
+        style.configure('Warning.TLabel', foreground='#805008')
         style.configure('Title.TLabel', font=('Segoe UI', 19, 'bold'))
         style.configure('Section.TLabel', font=('Segoe UI', 11, 'bold'))
         style.configure('Panel.TFrame', background=PANEL, bordercolor=LINE, lightcolor=LINE, darkcolor=LINE)
@@ -217,7 +232,12 @@ class Application:
         (self.source_entry, self.choose_source) = self.path_field(
             setup, 0, 'Список сайтов', self.source, self.browse_source)
         (self.archive_entry, self.choose_archive) = self.path_field(
-            setup, 1, 'Сохранять в', self.archive, self.browse_archive)
+            setup, 1, 'Сохранять в', self.destination, self.browse_archive)
+        ttk.Label(setup, text='Сохраняйте бэкапы на общий сетевой диск', style='Muted.TLabel').grid(
+            row=2, column=1, sticky='w', pady=(4, 0))
+        warning = ttk.Label(setup, textvariable=self.destination_warning, style='Warning.TLabel', wraplength=300)
+        warning.grid(row=3, column=1, sticky='ew')
+        self.archive_entry.master.bind('<Configure>', lambda event: warning.configure(wraplength=event.width))
         ttk.Label(setup, text='Нагрузка', style='Muted.TLabel').grid(row=0, column=2, sticky='w', pady=(0, 4))
         self.mode = ttk.Combobox(setup, values=('Обычная · до 4 страниц', 'Щадящая · до 2 страниц'),
                                  width=25, state='readonly')
@@ -372,12 +392,14 @@ class Application:
         open_archive.pack(side='left')
         journal = ttk.Button(footer, text='Журнал', command=self.show_log)
         journal.pack(side='left', padx=7)
+        self.delivery_button = ttk.Button(footer, textvariable=self.pending_delivery_label,
+                                          command=self.show_pending_delivery)
         about_button = ttk.Button(footer, text='О приложении', command=self.show_about)
         about_button.pack(side='right')
 
         for widget, tip in (
             (self.choose_source, 'Выберите XLSX, CSV, TSV или TXT со ссылками.'),
-            (self.choose_archive, 'Выберите папку для снимков, отчётов и состояния обработки.'),
+            (self.choose_archive, 'Выберите папку назначения для снимков и оригиналов.'),
             (self.mode, 'Щадящий режим уменьшает число одновременно открытых страниц.'),
             (self.start_button, 'Сохраняет сайты из списка. Готовые файлы при продолжении пропускаются.'),
             (self.stop_button, 'Останавливает обработку. Готовые файлы сохраняются.'),
@@ -397,7 +419,7 @@ class Application:
             (self.history_button, 'Показывает попытки сохранения с датой и результатом.'),
             (self.open_file_button, 'Открывает файл выбранной строки.'),
             (self.open_report_button, 'Открывает последний XLSX выбранного списка.'),
-            (open_archive, 'Открывает архив в Проводнике. Снимки находятся в captures.'),
+            (open_archive, 'Открывает папку назначения в Проводнике.'),
             (journal, 'Показывает события текущего сеанса с местным временем.'),
             (about_button, 'Версия, инструкция, список изменений и контакт разработчика.'),
         ):
@@ -474,7 +496,7 @@ class Application:
              '«Ссылка», «Адрес» или «Сайт». В TXT укажите по одной ссылке на строку. '
              'Столбцы «ИНН» и «Компания» помогут найти нужную строку.'),
             ('2. Выберите папку и запустите обработку',
-             'В поле «Сохранять в» выберите папку архива. Нажмите «Начать обработку». '
+             'В поле «Сохранять в» проверьте путь к общей папке. Нажмите «Начать обработку». '
              'Чтобы сначала посмотреть список, выберите «Действия → Загрузить список». '
              'Ход работы виден над таблицей. После остановки можно продолжить с оставшихся сайтов.'),
             ('3. Проверьте результаты',
@@ -605,7 +627,7 @@ class Application:
             self.filter_changed()
 
     def read_db(self):
-        path = Path(self.archive.get()) / 'archive.sqlite3'
+        path = self.archive_root / 'archive.sqlite3'
         if not path.is_file():
             return None
         db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.05)
@@ -658,7 +680,12 @@ class Application:
                 db.close()
             return [], 0, {}
         try:
-            base = ''' FROM input_rows i JOIN resources r ON r.id=i.resource_id WHERE i.list_id=?'''
+            base = ' FROM input_rows i JOIN resources r ON r.id=i.resource_id'
+            has_delivery = db.execute("SELECT 1 FROM sqlite_master WHERE name='deliveries'").fetchone()
+            if has_delivery:
+                base += (" LEFT JOIN deliveries d ON d.source=r.path"
+                         " LEFT JOIN deliveries o ON o.attempt_id=d.attempt_id AND o.kind='original'")
+            base += ' WHERE i.list_id=?'
             params = [self.list_id]
             counts = {r['state']: r['n'] for r in db.execute('SELECT r.state,count(*) n' + base + ' GROUP BY r.state', params)}
             if self.filter_key == 'actions':
@@ -676,6 +703,8 @@ class Application:
             columns = {r['name'] for r in db.execute('PRAGMA table_info(resources)')}
             metadata = ''.join(f',r.{name}' if name in columns else f',NULL AS {name}'
                                for name in ('http_status', 'checked_at'))
+            if has_delivery:
+                metadata += ',d.directory,d.candidate,d.delivered,o.candidate AS original_candidate,o.delivered AS original_delivered'
             sql = ('SELECT i.*,r.state,r.reason,r.final_url,r.path,r.quality,r.updated,r.size'
                    + metadata + base + ' ORDER BY i.id')
             if not all_rows:
@@ -842,10 +871,13 @@ class Application:
             if row['path']:
                 label = 'Сохранённый файл' if state in SAVED else 'Файл предыдущей попытки'
                 parts.extend([(f'\n{label} · {file_size(row["size"])}\n', 'muted'),
-                              (str(Path(row['path']).name), '')])
+                              (row['candidate'] if row.get('delivered') else Path(row['path']).name, '')])
                 if row['quality'] == 'dated_document':
                     parts.extend([('\nИсходный PDF\n', 'muted'),
-                                  (original_path(Path(row['path'])).name, '')])
+                                  (row['original_candidate'] if row.get('original_delivered') else
+                                   original_path(Path(row['path'])).name, '')])
+                if row.get('directory') and (not row.get('delivered') or row.get('original_delivered') == 0):
+                    parts.append(('\nЕсть файлы, ожидающие отправки\n', 'reason'))
         if self.detail_parts != parts:
             self.detail_parts = parts
             self.detail.configure(state='normal')
@@ -876,6 +908,11 @@ class Application:
         try:
             attempts = db.execute('''SELECT * FROM attempts
                 WHERE resource_id=? ORDER BY started DESC LIMIT 200''', (row['resource_id'],)).fetchall()
+            deliveries = {}
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='deliveries'").fetchone():
+                for item in db.execute('''SELECT d.* FROM deliveries d JOIN attempts a ON a.id=d.attempt_id
+                                          WHERE a.resource_id=?''', (row['resource_id'],)):
+                    deliveries[item['attempt_id'], item['kind']] = item
         except sqlite3.Error as error:
             return self.error(error)
         finally:
@@ -899,16 +936,23 @@ class Application:
                 if attempt[key]:
                     history.insert('end', attempt[key] + '\n')
             if attempt['state'] in SAVED and attempt['target']:
-                target = Path(self.archive.get()) / attempt['target']
-                files = [('Открыть файл попытки', target)]
+                target = self.archive_root / attempt['target']
+                files = [('backup', 'Открыть файл попытки', target)]
                 if 'original_sha' in attempt.keys() and attempt['original_sha']:
-                    files.append(('Открыть исходный PDF', original_path(target)))
-                for label, path in files:
-                    if path.is_file():
-                        tag = f'file-{index}-{label}'
-                        history.insert('end', label + '\n', tag)
-                        history.tag_configure(tag, foreground=BLUE, underline=True)
-                        history.tag_bind(tag, '<Button-1>', lambda event, file=path: os.startfile(file))
+                    files.append(('original', 'Открыть исходный PDF', original_path(target)))
+                for kind, label, local in files:
+                    delivery = deliveries.get((attempt['id'], kind))
+                    path = local
+                    if delivery:
+                        if delivery['delivered']:
+                            path = Path(delivery['directory']) / delivery['candidate']
+                        else:
+                            history.insert('end', f'Ожидает отправки: {delivery["name"]}\n')
+                    tag = f'file-{index}-{kind}'
+                    history.insert('end', f'{label} · {path.name}\n', tag)
+                    history.tag_configure(tag, foreground=BLUE, underline=True)
+                    history.tag_bind(tag, '<Button-1>',
+                                     lambda event, file=path, fallback=local: self.open_backup(file, fallback))
             history.insert('end', '\n')
         if not attempts:
             history.insert('end', 'Попыток сохранения пока нет.')
@@ -948,7 +992,7 @@ class Application:
             if not rows:
                 return 'break'
             if kind in ('rows', 'filter'):
-                values = [REPORT_HEADERS] + [report_values(r, self.archive.get()) for r in rows]
+                values = [REPORT_HEADERS] + [report_values(r, self.archive_root) for r in rows]
             else:
                 key = self.active_column if kind == 'cell' else kind
                 value = rows[0][key]
@@ -985,22 +1029,86 @@ class Application:
         self.filter_changed()
 
     def browse_archive(self):
-        path = filedialog.askdirectory(title='Папка архива сайтов')
+        path = filedialog.askdirectory(title='Папка для бэкапов')
         if path:
-            self.archive.set(path)
+            self.destination.set(path)
             self.archive_entry.xview_moveto(1)
-            self.list_id = None
-            self.report = None
-            self.phase.set('Подготовка списка')
-            self.load_lists()
-            self.filter_changed()
+            self.save_settings()
+
+    def destination_changed(self, *args):
+        path = self.destination.get().strip()
+        if not path:
+            warning = 'Укажите путь к общей папке.'
+        elif is_network_path(path):
+            warning = ''
+        else:
+            warning = ('Эта папка находится на локальном диске. Выберите общую сетевую папку, '
+                       'чтобы коллеги могли открыть бэкапы')
+        self.destination_warning.set(warning)
+
+    def refresh_pending_delivery(self):
+        db = self.read_db()
+        count = 0
+        if db is not None:
+            try:
+                if db.execute("SELECT 1 FROM sqlite_master WHERE name='deliveries'").fetchone():
+                    count = db.execute('SELECT count(*) FROM deliveries WHERE delivered=0').fetchone()[0]
+            except sqlite3.Error:
+                return
+            finally:
+                db.close()
+        if count:
+            self.pending_delivery_label.set(f'Не отправлено: {count}')
+            self.delivery_button.pack(side='left')
+        else:
+            self.delivery_button.pack_forget()
+
+    def show_pending_delivery(self):
+        db = self.read_db()
+        if db is None:
+            return
+        try:
+            files = db.execute('''SELECT d.*, b.candidate AS backup_candidate, b.delivered AS backup_delivered
+                FROM deliveries d LEFT JOIN deliveries b ON b.attempt_id=d.attempt_id AND b.kind='backup'
+                WHERE d.delivered=0 ORDER BY d.directory,d.name''').fetchall()
+        except sqlite3.Error as error:
+            return self.error(error)
+        finally:
+            db.close()
+        if not files:
+            self.refresh_pending_delivery()
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title('Неотправленные файлы')
+        dialog.transient(self.root)
+        dialog.geometry('720x400')
+        panel = ttk.Frame(dialog, padding=14)
+        panel.pack(fill='both', expand=True)
+        ttk.Label(panel, text=f'Ожидают отправки: {len(files)}', style='Section.TLabel').pack(anchor='w')
+        contents = ScrolledText(panel, wrap='word', background=PANEL, foreground=INK, relief='flat', padx=8, pady=8)
+        contents.pack(fill='both', expand=True, pady=8)
+        for item in files:
+            name = item['candidate'] or item['name']
+            if item['kind'] == 'original' and not item['candidate'] and item['backup_delivered']:
+                name = original_path(Path(item['backup_candidate'])).name
+            reason = item['error'] or 'Ожидает отправки'
+            contents.insert('end', f'{Path(item["directory"]) / name}\n{reason}\n\n')
+        contents.configure(state='disabled')
+
+        def retry():
+            dialog.destroy()
+            self.start('retry_delivery')
+
+        ttk.Button(panel, text='Повторить отправку', command=retry).pack(side='left')
+        ttk.Button(panel, text='Закрыть', command=dialog.destroy).pack(side='right')
+        dialog.bind('<Escape>', lambda event: dialog.destroy())
 
     def busy(self):
         return self.session.state in ('starting', 'running', 'stopping')
 
     def set_busy(self, active):
         for widget in (self.start_button, self.choose_source, self.choose_archive, self.options,
-                       self.source_entry, self.archive_entry):
+                       self.source_entry, self.archive_entry, self.delivery_button):
             widget.configure(state='disabled' if active else 'normal')
         for widget in (self.list_combo, self.mode):
             widget.configure(state='disabled' if active else 'readonly')
@@ -1017,12 +1125,14 @@ class Application:
     def start(self, operation, **extra):
         if self.busy():
             return
-        if not self.archive.get().strip():
-            return self.error('Выберите папку архива')
+        destination = self.destination.get().strip()
+        if not destination and operation in ('batch', 'manual', 'attach'):
+            return self.error('Укажите папку назначения для бэкапов')
         source = self.source.get().strip()
         if operation == 'import' and not source:
             return self.error('Выберите список')
-        payload = {'operation': operation, 'archive': self.archive.get(), 'list_id': self.list_id,
+        payload = {'operation': operation, 'archive': str(self.archive_root), 'destination': destination,
+                   'list_id': self.list_id,
                    'gentle': self.gentle.get(), 'refresh': self.refresh.get(), **extra}
         if operation == 'import' or (operation == 'batch' and not self.list_id):
             if not source:
@@ -1035,7 +1145,8 @@ class Application:
             self.set_busy(True)
             self.phase.set({'batch': 'Автоматическая обработка', 'import': 'Загрузка списка',
                             'manual': 'Ручная помощь', 'attach': 'Прикрепление PDF',
-                            'verify': 'Проверка файлов', 'export': 'Выгрузка отчёта'}[operation])
+                            'verify': 'Проверка файлов', 'export': 'Выгрузка отчёта',
+                            'retry_delivery': 'Повторная отправка файлов'}[operation])
             self.set_status('Запуск…')
             self.update_progress(0, 0)
             self.save_settings()
@@ -1105,6 +1216,9 @@ class Application:
             elif kind == 'report':
                 self.report = event['path']
                 self.log(f'Отчёт сохранён · {self.report}')
+            elif kind == 'delivery':
+                self.phase.set('Отправка файлов в папку назначения')
+                self.set_status('Проверка доступа и копирование…')
             elif kind == 'final':
                 self.dirty = True
                 finished = {'batch': 'Автоматическая обработка завершена', 'import': 'Список готов к обработке',
@@ -1118,6 +1232,12 @@ class Application:
                                  'error': 'Ошибка: ' + event.get('reason', '')}.get(event['outcome'], event['outcome']))
                 if event.get('report_error'):
                     self.set_status('Файлы учтены. Ошибка выгрузки отчёта: ' + event['report_error'])
+                if event.get('pending_delivery'):
+                    self.phase.set('Остались неотправленные файлы')
+                    self.set_status(f'Не отправлено файлов: {event["pending_delivery"]}. '
+                                    'Откройте список неотправленных файлов и повторите отправку.')
+                elif self.operation == 'retry_delivery' and event['outcome'] == 'success':
+                    self.set_status('Все файлы отправлены в папки назначения.')
                 if self.operation == 'import' and event['outcome'] == 'success' and not event.get('report_error'):
                     self.set_status('Список загружен. Нажмите «Начать обработку».')
         if self.session.state == 'finished' and self.operation:
@@ -1132,6 +1252,7 @@ class Application:
             self.dirty = True
         if self.dirty and time.monotonic() >= self.next_read:
             self.refresh_table()
+            self.refresh_pending_delivery()
             self.dirty = False
             self.next_read = time.monotonic() + .5
         if self.closing and not self.busy():
@@ -1140,33 +1261,45 @@ class Application:
         self.root.after(150, self.poll)
 
     def save_settings(self):
-        data = {'source': self.source.get(), 'archive': self.archive.get(),
+        data = {'source': self.source.get(), 'archive_root': str(self.archive_root),
+                'destination': self.destination.get().strip(),
                 'gentle': self.gentle.get(), 'list_id': self.list_id, 'onboarding_seen': self.onboarding_seen}
         try:
+            self.home.mkdir(parents=True, exist_ok=True)
             self.settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         except OSError:
             pass
 
     def open_archive(self):
-        path = Path(self.archive.get())
-        if path.is_dir():
-            os.startfile(path)
+        path = self.destination.get().strip()
+        if path:
+            try:
+                os.startfile(path)
+            except OSError as error:
+                self.error(error)
 
     def open_artifact(self):
         row = self.selected_row()
         if row and row['path']:
-            path = Path(self.archive.get()) / row['path']
-            if path.is_file():
-                os.startfile(path)
-            else:
-                self.error('Файл отсутствует. Запустите повторное сохранение.')
+            local = self.archive_root / row['path']
+            path = Path(row['directory']) / row['candidate'] if row.get('delivered') else local
+            self.open_backup(path, local)
+
+    def open_backup(self, path, local):
+        try:
+            os.startfile(path)
+        except OSError:
+            try:
+                os.startfile(local)
+            except OSError as error:
+                self.error(error)
 
     def open_report(self):
         if self.report and Path(self.report).is_file():
             os.startfile(self.report)
             return
         if self.list_id:
-            path = Path(self.archive.get()) / 'exports' / self.list_id[:12]
+            path = self.archive_root / 'exports' / self.list_id[:12]
             reports = sorted(path.glob('report-*.xlsx'), reverse=True)
             if reports:
                 os.startfile(reports[0])

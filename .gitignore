@@ -8,6 +8,7 @@ fixtures/assets/fixture.ttf
 reports/
 test pdf/
 settings.json
+delivery.local.json
 .tools/
 .venv/
 .wheelhouse/

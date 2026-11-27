@@ -626,6 +626,7 @@ class Runner:
                         if command.get('session_id') != self.session:
                             continue
                         if command.get('type') == 'cancel':
+                            self.cancelled.set()
                             break
                         if command.get('type') == 'save_manual':
                             pages = context.pages
@@ -691,9 +692,10 @@ class Runner:
         return await capture_html(selected, staged, status)
 
     async def execute(self):
-        archive = Archive(self.payload['archive'])
+        archive = Archive(self.payload['archive'], self.payload.get('destination', ''))
         try:
             operation = self.payload.get('operation', 'batch')
+            previous_delivery = archive.db.execute('SELECT coalesce(max(rowid),0) FROM deliveries').fetchone()[0]
             list_id = self.payload.get('list_id')
             if self.payload.get('source'):
                 self.send('notice', text='Чтение списка…')
@@ -701,6 +703,8 @@ class Runner:
             if not list_id:
                 row = archive.db.execute('SELECT id FROM lists ORDER BY created DESC LIMIT 1').fetchone()
                 if not row:
+                    if operation == 'retry_delivery':
+                        return {'outcome': 'success', 'pending_delivery': 0}
                     raise ValueError('Сначала загрузите список XLSX/CSV')
                 list_id = row['id']
             self.send('loaded', list_id=list_id)
@@ -733,10 +737,20 @@ class Runner:
                             archive.db.execute("UPDATE resources SET state='error',reason=? WHERE id=?",
                                                ('Файл отсутствует, повреждён или изменён; нужен повтор', item['id']))
                 outcome = 'success'
-            elif operation == 'export':
+            elif operation in ('export', 'retry_delivery'):
                 outcome = 'success'
             else:
                 outcome = await self.batch(archive, list_id)
+            if operation in ('batch', 'manual', 'attach', 'retry_delivery'):
+                if not self.cancelled.is_set():
+                    self.send('delivery')
+                pending_delivery = archive.send_pending(
+                    self.delivery_cancelled, lambda text: self.send('log', at=time.time(), text=text),
+                    after=0 if operation == 'retry_delivery' else previous_delivery)
+                if self.cancelled.is_set() and outcome == 'success':
+                    outcome = 'cancelled'
+            else:
+                pending_delivery = None
             try:
                 report = export_reports(archive, list_id)
                 self.send('report', path=report)
@@ -747,9 +761,17 @@ class Runner:
             counts = {}
             for row in archive.rows(list_id):
                 counts[row['state']] = counts.get(row['state'], 0) + 1
-            return {'outcome': outcome, 'list_id': list_id, 'counts': counts, 'report_error': report_error}
+            return {'outcome': outcome, 'list_id': list_id, 'counts': counts, 'report_error': report_error,
+                    'pending_delivery': pending_delivery}
         finally:
             archive.close()
+
+    def delivery_cancelled(self):
+        if self.connection.poll():
+            command = self.connection.recv()
+            if command.get('session_id') == self.session and command.get('type') == 'cancel':
+                self.cancelled.set()
+        return self.cancelled.is_set()
 
 
 def run_job(connection, session_id, payload):

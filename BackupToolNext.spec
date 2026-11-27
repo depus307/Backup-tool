@@ -13,7 +13,9 @@ analysis = Analysis(
     [str(root / 'launcher.py')],
     pathex=[str(root)],
     binaries=[],
-    datas=collect_data_files('playwright') + [(str(icon), '.'), (str(root / 'CHANGELOG.md'), '.')] + ssl_data,
+    datas=collect_data_files('playwright') + [
+        (str(icon), '.'), (str(root / 'CHANGELOG.md'), '.'), (str(root / 'delivery.json'), '.'),
+    ] + ssl_data,
     hiddenimports=['playwright.async_api', 'openpyxl', 'pypdf', 'httpx'],
     hookspath=[],
     hooksconfig={},

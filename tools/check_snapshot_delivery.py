@@ -1,5 +1,6 @@
 """Real-browser acceptance for dated snapshots, also runnable against the shipped EXE."""
 import argparse
+from collections import defaultdict
 import csv
 from contextlib import contextmanager
 from datetime import datetime
@@ -71,14 +72,18 @@ def main():
             f'0123456789;Snapshot Test;{base}{route}' for route in routes) + '\n'
             + f'0987654321;Offline;{dead_url}\n', encoding='utf-8-sig')
         archive_path = folder / 'archive'
+        destination = folder / 'shared'
         print('Running browser worker', flush=True)
-        final, events = run({'archive': str(archive_path), 'source': str(source), 'browser': 'chrome'})
+        final, events = run({'archive': str(archive_path), 'destination': str(destination),
+                             'source': str(source), 'browser': 'chrome'})
+        assert final['pending_delivery'] == 0, final
         assert final['counts'] == {'ready': 4, 'saved_error': 15, 'document': 1, 'error': 3}, final
         with sqlite3.connect(archive_path / 'archive.sqlite3') as db:
             db.row_factory = sqlite3.Row
             rows = {row['url']: dict(row) for row in db.execute('SELECT * FROM resources')}
             history = [dict(row) for row in db.execute('SELECT * FROM attempts')]
-        snapshots = []
+            deliveries = {row['source']: dict(row) for row in db.execute('SELECT * FROM deliveries')}
+        snapshots = defaultdict(set)
         for route in routes:
             row = rows[base + route]
             if route in ('/blank', '/blank-styled', '/fake.pdf', '/original.docx'):
@@ -86,18 +91,19 @@ def main():
             assert row['state'] in ('ready', 'saved_error') and row['http_status'], row
             assert datetime.fromisoformat(row['checked_at']).utcoffset() is not None, row
             path = archive_path / row['path']
-            snapshots.append(path)
+            date = datetime.fromisoformat(row['checked_at']).date().isoformat()
+            snapshots[date].add(path.name)
+            delivery = deliveries[row['path']]
+            assert delivery['delivered'] and (destination / delivery['candidate']).read_bytes() == path.read_bytes()
             text = pdf_text(path)
             assert format_capture_time(row['checked_at']) in text and f'HTTP {row["http_status"]}' in text, text
             assert row['final_url'] in text, text
             assert any(a['resource_id'] == row['id'] and a['checked_at'] == row['checked_at']
                        and a['http_status'] == row['http_status'] and a['reason'] == row['reason']
                        for a in history)
-        assert len({path.parent for path in snapshots}) == 1
-        stem = 'Snapshot-Test_0123456789'
-        assert {path.name for path in snapshots} == {
-            f'{stem}.pdf', *(f'{stem}_{i}.pdf' for i in range(1, len(snapshots)))
-        }
+        for date, names in snapshots.items():
+            stem = f'0123456789_Snapshot-Test_{date}'
+            assert names == {f'{stem}.pdf', *(f'{stem}_{i}.pdf' for i in range(1, len(names)))}
         for route in routes:
             if route.startswith('/status/'):
                 status = int(route.rsplit('/', 1)[1])
@@ -134,13 +140,18 @@ def main():
         catalog_path = archive_path / catalog['path']
         assert catalog['quality'] == 'dated_document'
         assert original_path(catalog_path).read_bytes() == (ASSETS / 'useful.pdf').read_bytes()
+        assert original_path(destination / deliveries[catalog['path']]['candidate']).read_bytes() == (
+            ASSETS / 'useful.pdf').read_bytes()
         assert 'ORIGINAL-PDF-001' in pdf_text(catalog_path)
         assert format_capture_time(catalog['checked_at']) in pdf_text(catalog_path)
-        assert (archive_path / rows[base + '/original.docx']['path']).read_bytes() == (ASSETS / 'original.docx').read_bytes()
+        doc = rows[base + '/original.docx']
+        assert (archive_path / doc['path']).read_bytes() == (ASSETS / 'original.docx').read_bytes()
+        assert (destination / deliveries[doc['path']]['candidate']).read_bytes() == (ASSETS / 'original.docx').read_bytes()
         checks.append('Real Chrome: error HTML 400/402/403/404/429/500/502/503/504, Tilda-like placeholder, '
                       'login/challenge/blank/SPA, redirects, HTML at document URL; no repeated HTML requests')
         checks.append('Every rendered PDF has matching URL, HTTP status and timezone-aware timestamp in archive/history')
         checks.append('Connection failure produces dated evidence; invalid PDF is rejected; originals stay byte-identical')
+        checks.append('New captures include their calendar date and are published with originals to the destination')
         report = Path(next(e['path'] for e in events if e['type'] == 'report'))
         book = load_workbook(report, read_only=True)
         try:

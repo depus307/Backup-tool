@@ -14,6 +14,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
+from .delivery import is_network_path, publish_file
 from .evidence import format_capture_time, original_path
 
 LABELS = {'pending': 'В очереди', 'running': 'Обработка', 'ready': 'Готово',
@@ -39,7 +40,8 @@ def backup_name(company, inn, url):
     company = company.strip() or (urlsplit(url).hostname or 'site')
     company = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', '-', company).strip(' .-') or 'site'
     inn = re.sub(r'[^\w-]+', '-', inn).strip('-')
-    return company[:90].rstrip(' .-') + (f'_{inn[:30]}' if inn else '')
+    company = company[:90].rstrip(' .-')
+    return f'{inn[:30]}_{company}' if inn else company
 
 
 def hide_service_file(path):
@@ -156,10 +158,15 @@ def valid_pdf(path):
 
 
 class Archive:
-    def __init__(self, folder):
+    def __init__(self, folder, destination=''):
+        if is_network_path(folder):
+            raise ValueError('Рабочий архив должен находиться на локальном диске')
         self.root = Path(folder).resolve()
-        if str(self.root).startswith('\\\\'):
-            raise ValueError('Рабочий архив должен находиться на локальном диске, не на SMB')
+        if is_network_path(self.root):
+            raise ValueError('Рабочий архив должен находиться на локальном диске')
+        self.destination = str(Path(destination).absolute()) if destination else ''
+        if self.destination and Path(self.destination) == self.root / 'captures':
+            raise ValueError('Выберите папку назначения вне рабочего архива снимков')
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = (self.root / '.writer.lock').open('a+b')
         hide_service_file(self.root / '.writer.lock')
@@ -195,13 +202,22 @@ class Archive:
                 started REAL, ended REAL, state TEXT, reason TEXT DEFAULT '', staged TEXT DEFAULT '',
                 target TEXT DEFAULT '', sha TEXT DEFAULT '', quality TEXT DEFAULT '', final_url TEXT DEFAULT '');
             CREATE INDEX IF NOT EXISTS attempts_resource ON attempts(resource_id, started);
+            CREATE INDEX IF NOT EXISTS attempts_target ON attempts(target);
+            CREATE TABLE IF NOT EXISTS deliveries(
+                attempt_id TEXT REFERENCES attempts(id), kind TEXT, source TEXT UNIQUE,
+                directory TEXT, name TEXT, candidate TEXT DEFAULT '', delivered INTEGER DEFAULT 0,
+                error TEXT DEFAULT '', PRIMARY KEY (attempt_id, kind));
+            CREATE INDEX IF NOT EXISTS deliveries_pending ON deliveries(delivered);
         ''')
         # Additive migration: existing archives and their earlier captures stay readable.
         with self.db:
             for table in ('resources', 'attempts'):
                 columns = {row['name'] for row in self.db.execute(f'PRAGMA table_info({table})')}
-                for name, definition in (('http_status', 'INTEGER'), ('checked_at', "TEXT DEFAULT ''"),
-                                         ('original_sha', "TEXT DEFAULT ''")):
+                metadata = [('http_status', 'INTEGER'), ('checked_at', "TEXT DEFAULT ''"),
+                            ('original_sha', "TEXT DEFAULT ''")]
+                if table == 'attempts':
+                    metadata += [('destination', "TEXT DEFAULT ''"), ('filename', "TEXT DEFAULT ''")]
+                for name, definition in metadata:
                     if name not in columns:
                         self.db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
         self.recover()
@@ -282,8 +298,12 @@ class Archive:
 
     def rows(self, list_id):
         return [dict(r) for r in self.db.execute('''SELECT i.*,r.state,r.reason,r.final_url,r.path,r.quality,r.updated,
-            r.http_status,r.checked_at,r.original_sha
-            FROM input_rows i JOIN resources r ON r.id=i.resource_id WHERE i.list_id=? ORDER BY i.id''', (list_id,))]
+            r.http_status,r.checked_at,r.original_sha,d.directory,d.candidate,d.delivered,o.candidate AS original_candidate,
+            o.delivered AS original_delivered
+            FROM input_rows i JOIN resources r ON r.id=i.resource_id
+            LEFT JOIN deliveries d ON d.source=r.path
+            LEFT JOIN deliveries o ON o.attempt_id=d.attempt_id AND o.kind='original'
+            WHERE i.list_id=? ORDER BY i.id''', (list_id,))]
 
     def begin(self, resource, run):
         attempt = uuid.uuid4().hex
@@ -309,22 +329,25 @@ class Archive:
             valid_pdf(staged)
         sha = hashlib.sha256(staged.read_bytes()).hexdigest()
         original_sha = hashlib.sha256(original.read_bytes()).hexdigest() if original else ''
-        item = self.db.execute('SELECT * FROM attempts WHERE id=?', (attempt,)).fetchone()
         safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '-', name).strip(' .')[:120].rstrip(' .') or 'site'
         if re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])', safe.split('.')[0], re.I):
             safe = '_' + safe
-        folder = self.root / 'captures' / item['run_id']
+        captured = datetime.fromisoformat(checked_at) if checked_at else datetime.now().astimezone()
+        safe += '_' + captured.date().isoformat()
+        folder = self.root / 'captures'
         target = folder / (safe + extension)
         copy_number = 0
-        while target.exists() or original_path(target).exists():
+        while (target.exists() or original_path(target).exists() or self.db.execute(
+                'SELECT 1 FROM attempts WHERE target=? LIMIT 1', (str(target.relative_to(self.root)),)).fetchone()):
             copy_number += 1
             target = folder / f'{safe}_{copy_number}{extension}'
         target.parent.mkdir(parents=True, exist_ok=True)
         with self.db:
             self.db.execute('''UPDATE attempts SET state='publishing',staged=?,target=?,sha=?,quality=?,final_url=?,
-                               reason=?,http_status=?,checked_at=?,original_sha=?
+                               reason=?,http_status=?,checked_at=?,original_sha=?,destination=?,filename=?
                                WHERE id=?''', (str(staged.relative_to(self.root)), str(target.relative_to(self.root)),
-                                              sha, quality, final_url, reason, http_status, checked_at, original_sha, attempt))
+                                              sha, quality, final_url, reason, http_status, checked_at, original_sha,
+                                              self.destination, safe + extension, attempt))
         item = self.db.execute('SELECT * FROM attempts WHERE id=?', (attempt,)).fetchone()
         self._publish_original(item, target)
         os.replace(staged, target)
@@ -347,12 +370,52 @@ class Archive:
                  or (item['http_status'] or 0) >= 400 else
                  'ready' if target.suffix == '.pdf' else 'document')
         with self.db:
+            local_path = target.relative_to(self.root)
+            if item['destination']:
+                self.db.execute('INSERT INTO deliveries(attempt_id,kind,source,directory,name) VALUES(?,?,?,?,?)',
+                                (item['id'], 'backup', str(local_path), item['destination'], item['filename']))
+                if item['original_sha']:
+                    self.db.execute('INSERT INTO deliveries(attempt_id,kind,source,directory,name) VALUES(?,?,?,?,?)',
+                                    (item['id'], 'original', str(original_path(local_path)), item['destination'],
+                                     original_path(Path(item['filename'])).name))
             self.db.execute('UPDATE attempts SET state=?,ended=? WHERE id=?', (state, time.time(), item['id']))
             self.db.execute('''UPDATE resources SET state=?,reason=?,path=?,sha=?,size=?,mtime=?,quality=?,
                 final_url=?,http_status=?,checked_at=?,original_sha=?,updated=? WHERE id=?''',
-                (state, item['reason'], str(target.relative_to(self.root)), item['sha'],
+                (state, item['reason'], str(local_path), item['sha'],
                  stat.st_size, stat.st_mtime_ns, item['quality'], item['final_url'], item['http_status'],
                  item['checked_at'], item['original_sha'], time.time(), item['resource_id']))
+
+    def send_pending(self, cancelled, notify, *, after=0):
+        pending = self.db.execute('''SELECT d.* FROM deliveries d JOIN attempts a ON a.id=d.attempt_id
+            WHERE d.delivered=0 AND d.rowid>? ORDER BY a.started, d.attempt_id, d.kind''', (after,)).fetchall()
+        for item in pending:
+            if cancelled():
+                break
+            key = (item['attempt_id'], item['kind'])
+            name = item['name']
+            if item['kind'] == 'original':
+                backup = self.db.execute("SELECT candidate,delivered FROM deliveries WHERE attempt_id=? AND kind='backup'",
+                                         (item['attempt_id'],)).fetchone()
+                if not backup['delivered']:
+                    continue
+                name = original_path(Path(backup['candidate'])).name
+
+            def remember(candidate):
+                with self.db:
+                    self.db.execute('UPDATE deliveries SET candidate=? WHERE attempt_id=? AND kind=?', (candidate, *key))
+
+            try:
+                target = publish_file(self.root / item['source'], Path(item['directory']), name,
+                                      f'.backuptool-{item["attempt_id"]}-{item["kind"]}.part', item['candidate'], remember)
+            except OSError as error:
+                with self.db:
+                    self.db.execute('UPDATE deliveries SET error=? WHERE attempt_id=? AND kind=?', (str(error), *key))
+                notify(f'Не отправлен {name} · {item["directory"]} · {error}')
+            else:
+                with self.db:
+                    self.db.execute("UPDATE deliveries SET delivered=1,error='' WHERE attempt_id=? AND kind=?", key)
+                notify(f'Отправлен {target}')
+        return self.db.execute('SELECT count(*) FROM deliveries WHERE delivered=0').fetchone()[0]
 
     def reusable(self, resource, full=False):
         if resource['state'] not in SAVED or not resource['path']:
@@ -385,14 +448,15 @@ class Archive:
 REPORT_FIELDS = ('inn', 'company', 'url', 'state', 'reason', 'final_url', 'path', 'quality', 'sheet', 'number')
 REPORT_HEADERS = ('ИНН', 'Компания', 'URL', 'Результат', 'Причина', 'Конечный URL', 'Файл', 'Проверка', 'Лист', 'Строка')
 EXPORT_HEADERS = REPORT_HEADERS + ('Время обработки', 'HTTP-статус', 'Дата и время снимка',
-                                   'Исходный PDF', 'SHA-256 исходного PDF')
+                                   'Исходный PDF', 'SHA-256 исходного PDF', 'Отправка в папку назначения')
 
 
 def report_values(row, root):
     values = [str(row.get(key, '')) for key in REPORT_FIELDS]
     values[3] = result_label(row)
     if row.get('path'):
-        values[6] = str(Path(root) / row['path'])
+        values[6] = str(Path(row['directory']) / row['candidate'] if row.get('delivered')
+                        else Path(root) / row['path'])
     return values
 
 
@@ -405,8 +469,14 @@ def export_reports(archive, list_id):
         stamp = (datetime.fromtimestamp(row['updated']).astimezone().isoformat(timespec='seconds')
                  if row['updated'] and row['state'] != 'pending' else '')
         original = str(original_path(archive.root / row['path'])) if row['original_sha'] and row['path'] else ''
+        if row['original_delivered']:
+            original = str(Path(row['directory']) / row['original_candidate'])
+        delivery = ''
+        if row['directory']:
+            delivery = ('Отправлено' if row['delivered'] and row['original_delivered'] != 0
+                        else 'Ожидает отправки')
         return report_values(row, archive.root) + [stamp, str(row['http_status'] or ''), format_capture_time(row['checked_at']),
-                                                    original, row['original_sha']]
+                                                    original, row['original_sha'], delivery]
 
     folder = archive.root / 'exports' / list_id[:12]
     folder.mkdir(parents=True, exist_ok=True)
@@ -421,7 +491,7 @@ def export_reports(archive, list_id):
                           ('Снимки с предупреждениями', [r for r in rows if r['state'] == 'saved_error'])]:
         sheet = book.create_sheet(title)
         sheet.freeze_panes = 'A2'
-        for key, width in zip('ABCDEFGHIJKLMNO', [18, 35, 60, 36, 70, 60, 60, 20, 20, 12, 30, 16, 36, 65, 65]):
+        for key, width in zip('ABCDEFGHIJKLMNOP', [18, 35, 60, 36, 70, 60, 60, 20, 20, 12, 30, 16, 36, 65, 65, 32]):
             sheet.column_dimensions[key].width = width
         sheet.append(EXPORT_HEADERS)
         for row in subset:
