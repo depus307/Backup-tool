@@ -114,14 +114,16 @@ class DestinationTests(unittest.TestCase):
 
     def test_distribution_default_is_unc(self):
         config = FIXTURE.parents[2] / 'delivery.json'
+        bundled = default_destination(config)
+        self.assertTrue(is_unc(bundled))
         with tempfile.TemporaryDirectory() as folder:
             override = Path(folder) / 'delivery.local.json'
-            self.assertEqual(default_destination(override, config), '')
+            self.assertEqual(default_destination(override, config), bundled)
             network_path = r'\\server\share\archive'
             override.write_text(json.dumps({'default_destination': network_path}), encoding='utf-8')
             self.assertEqual(default_destination(override, config), network_path)
             override.write_text(json.dumps({'default_destination': 'G:\\archive'}), encoding='utf-8')
-            self.assertEqual(default_destination(override, config), '')
+            self.assertEqual(default_destination(override, config), bundled)
         self.assertTrue(is_unc(r'\\?\UNC\server\share'))
         self.assertFalse(is_unc(r'\\?\C:\archive'))
         self.assertFalse(is_unc('G:\\archive'))

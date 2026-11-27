@@ -15,6 +15,7 @@ analysis = Analysis(
     binaries=[],
     datas=collect_data_files('playwright') + [
         (str(icon), '.'), (str(root / 'CHANGELOG.md'), '.'), (str(root / 'delivery.json'), '.'),
+        (str(root / 'backuptool' / 'apply_update.ps1'), 'backuptool'),
     ] + ssl_data,
     hiddenimports=['playwright.async_api', 'openpyxl', 'pypdf', 'httpx'],
     hookspath=[],

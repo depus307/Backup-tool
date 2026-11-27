@@ -3,15 +3,17 @@ from collections import Counter, deque
 import json
 import os
 from pathlib import Path
+from queue import Empty, SimpleQueue
 import sqlite3
 import sys
+from threading import Thread
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from urllib.parse import urlsplit
 
-from . import __version__
+from . import __version__, updates
 from .archive import GOOD, REPORT_HEADERS, SAVED, report_values, result_label
 from .delivery import default_destination, is_network_path
 from .evidence import format_capture_time, original_path
@@ -101,7 +103,8 @@ class Application:
     def __init__(self, root):
         self.root = root
         resources = Path(__file__).resolve().parents[1]
-        distribution = Path(sys.executable).parent if getattr(sys, 'frozen', False) else resources
+        self.executable = Path(sys.executable) if getattr(sys, 'frozen', False) else None
+        distribution = self.executable.parent if self.executable else resources
         self.home = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'BackupTool'
         icon = resources / 'BackupToolNext.ico'
         if icon.is_file():
@@ -114,8 +117,8 @@ class Application:
             settings = {}
         previous_archive = settings.get('archive', str(distribution / 'archive'))
         self.archive_root = Path(settings.get('archive_root', str(self.home / 'archive')))
-        destination = settings.get('destination', default_destination(
-            distribution / 'delivery.local.json', resources / 'delivery.json'))
+        destination = settings.get('destination') or default_destination(
+            distribution / 'delivery.local.json', resources / 'delivery.json')
         if 'archive_root' not in settings and previous_archive and not is_network_path(previous_archive):
             if (Path(previous_archive) / 'archive.sqlite3').is_file():
                 self.archive_root = Path(previous_archive).resolve()
@@ -160,6 +163,10 @@ class Application:
         self.log_lines = deque(maxlen=1500)
         self.log_window = None
         self.about_window = None
+        self.update_events = SimpleQueue()
+        self.available_update = None
+        self.update_task = None
+        self.update_label = tk.StringVar(value='Проверить обновления')
         self.build()
         self.source.trace_add('write', self.source_changed)
         self.destination.trace_add('write', self.destination_changed)
@@ -169,6 +176,13 @@ class Application:
         self.load_lists()
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(150, self.poll)
+        if self.executable:
+            result = updates.previous_result(distribution)
+            if result:
+                if result['success']:
+                    self.set_status(f'BackupTool обновлён до {result["version"]}.')
+                else:
+                    self.set_status('Ошибка обновления: ' + result['error'])
         if not self.onboarding_seen:
             root.after_idle(lambda: self.show_about('Инструкция'))
 
@@ -395,7 +409,9 @@ class Application:
         self.delivery_button = ttk.Button(footer, textvariable=self.pending_delivery_label,
                                           command=self.show_pending_delivery)
         about_button = ttk.Button(footer, text='О приложении', command=self.show_about)
-        about_button.pack(side='right')
+        self.update_button = ttk.Button(footer, textvariable=self.update_label, command=self.check_or_update)
+        self.update_button.pack(side='right')
+        about_button.pack(side='right', padx=(0, 7))
 
         for widget, tip in (
             (self.choose_source, 'Выберите XLSX, CSV, TSV или TXT со ссылками.'),
@@ -422,6 +438,7 @@ class Application:
             (open_archive, 'Открывает папку назначения в Проводнике.'),
             (journal, 'Показывает события текущего сеанса с местным временем.'),
             (about_button, 'Версия, инструкция, список изменений и контакт разработчика.'),
+            (self.update_button, 'Проверяет наличие новой стабильной версии на GitHub.'),
         ):
             tooltip(widget, tip)
         self.root.bind('<Configure>', self.layout, add='+')
@@ -1123,6 +1140,9 @@ class Application:
         self.manual_controls()
 
     def start(self, operation, **extra):
+        if self.update_task == 'download':
+            self.set_status('Дождитесь окончания загрузки обновления.')
+            return
         if self.busy():
             return
         destination = self.destination.get().strip()
@@ -1185,6 +1205,8 @@ class Application:
         self.set_status('Остановка и сохранение состояния…')
 
     def poll(self):
+        if self.poll_update():
+            return
         for event in self.session.poll():
             kind = event['type']
             if kind == 'loaded':
@@ -1310,7 +1332,70 @@ class Application:
         self.set_status(str(error))
         messagebox.showerror('BackupTool', str(error), parent=self.root)
 
+    def check_or_update(self):
+        if self.update_task:
+            return
+        if self.available_update:
+            if not self.executable:
+                return self.error('Обновление устанавливается из собранной версии BackupTool для Windows.')
+            if self.busy():
+                self.set_status('Установка доступна после завершения обработки.')
+                return
+            update = self.available_update
+            notes = f'\n\n{update.notes}' if update.notes else ''
+            if not messagebox.askyesno('Обновление BackupTool',
+                                       f'Установить версию {update.version} и перезапустить BackupTool?{notes}',
+                                       parent=self.root):
+                return
+            self.begin_update('download', updates.prepare, update, self.executable)
+        else:
+            self.begin_update('check', updates.latest_update, __version__)
+
+    def begin_update(self, task, action, *args):
+        self.update_task = task
+        self.update_button.configure(state='disabled')
+        self.update_label.set('Проверка обновлений…' if task == 'check' else 'Загрузка обновления…')
+
+        def run():
+            try:
+                result = action(*args)
+            except Exception as error:
+                self.update_events.put((False, str(error)))
+            else:
+                self.update_events.put((True, result))
+
+        Thread(target=run, daemon=True).start()
+
+    def poll_update(self):
+        try:
+            success, result = self.update_events.get_nowait()
+        except Empty:
+            return False
+        task, self.update_task = self.update_task, None
+        self.update_button.configure(state='normal')
+        if success and task == 'check':
+            self.available_update = result
+            if result is None:
+                self.set_status(f'Доступных обновлений для BackupTool {__version__} нет.')
+        self.update_label.set(f'Обновить до {self.available_update.version}' if self.available_update
+                              else 'Проверить обновления')
+        if not success:
+            self.error('Ошибка обновления: ' + result)
+        elif task == 'download':
+            try:
+                self.save_settings()
+                updates.install(result)
+            except OSError as error:
+                self.error(error)
+            else:
+                self.root.destroy()
+                return True
+        return False
+
     def close(self):
+        if self.update_task == 'download':
+            self.set_status('Дождитесь окончания загрузки обновления.')
+            return
         self.save_settings()
         if self.busy():
             self.closing = True
